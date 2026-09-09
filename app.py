@@ -215,6 +215,24 @@ def escribir(cfg, page_id: str, props: dict):
 UA = {"User-Agent": "libreria-luis/7.0 (catalogacion privada)"}
 
 
+def pedir(url: str, timeout: int = 15, intentos: int = 2):
+    """GET con un reintento. Resume el error: las trazas de red son ilegibles."""
+    ultimo = None
+    for i in range(intentos):
+        try:
+            r = requests.get(url, headers=UA, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            ultimo = e
+            if i + 1 < intentos:
+                time.sleep(1.5)
+    nombre = type(ultimo).__name__
+    if "Connection" in nombre or "Timeout" in nombre:
+        raise RuntimeError("no responde desde el servidor de la app (conexión rechazada)")
+    raise RuntimeError(str(ultimo)[:160])
+
+
 def sensato(datos: dict) -> dict:
     """Filtro anti-basura: descarta valores imposibles antes de escribirlos."""
     d = dict(datos)
@@ -249,9 +267,19 @@ def google_books(isbn: str) -> dict:
     if GOOGLE_KEY:
         url += f"&key={GOOGLE_KEY}"
     r = requests.get(url, headers=UA, timeout=20)
-    if r.status_code == 429:
-        raise RuntimeError("Google Books ha agotado la cuota (¿falta la clave de API?)")
-    r.raise_for_status()
+    if r.status_code != 200:
+        # El cuerpo trae el motivo exacto. Sin leerlo estaríamos adivinando,
+        # y la URL lleva la clave dentro: nunca la metemos en el mensaje.
+        motivo, razon = "", ""
+        try:
+            err = r.json().get("error", {})
+            motivo = err.get("message", "")
+            detalles = err.get("errors") or []
+            if detalles:
+                razon = detalles[0].get("reason", "")
+        except Exception:
+            motivo = r.text[:200]
+        raise RuntimeError(" · ".join(x for x in (f"HTTP {r.status_code}", razon, motivo) if x))
     d = r.json()
     if not d.get("totalItems"):
         return {}
@@ -267,9 +295,8 @@ def google_books(isbn: str) -> dict:
 
 
 def open_library(isbn: str) -> dict:
-    r = requests.get(f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}"
-                     "&format=json&jscmd=data", headers=UA, timeout=20)
-    r.raise_for_status()
+    r = pedir(f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}"
+              "&format=json&jscmd=data")
     d = r.json().get(f"ISBN:{isbn}")
     if not d:
         return {}
@@ -291,9 +318,7 @@ def open_library(isbn: str) -> dict:
 
 
 def open_library_search(isbn: str) -> dict:
-    r = requests.get(f"https://openlibrary.org/search.json?q=isbn:{isbn}&limit=1",
-                     headers=UA, timeout=20)
-    r.raise_for_status()
+    r = pedir(f"https://openlibrary.org/search.json?q=isbn:{isbn}&limit=1")
     docs = r.json().get("docs", [])
     if not docs:
         return {}
@@ -394,11 +419,16 @@ if st.button("🔎 Buscar y rellenar", type="primary", use_container_width=True)
         resultados = list(ex.map(lambda x: buscar(x["isbn"]), pendientes))
     barra.progress(1.0, text="Catálogos consultados.")
 
-    resumen, rellenadas, sin_ficha, avisos = [], 0, 0, []
+    resumen, rellenadas, sin_ficha = [], 0, 0
+    fallos_fuente, problemas_escritura = {}, []
     barra2 = st.progress(0.0, text="Escribiendo en Notion…")
 
     for i, (fila, (datos, usadas, errores)) in enumerate(zip(pendientes, resultados)):
-        avisos.extend(errores)
+        # Agrupamos por fuente: 300 líneas repetidas no informan más que una.
+        for e in errores:
+            fuente, _, detalle = e.partition(": ")
+            d = fallos_fuente.setdefault(fuente, {"n": 0, "ejemplo": detalle})
+            d["n"] += 1
         nuevos = {}
         for col in fila["huecos"]:
             clave = MAPA[col]
@@ -407,21 +437,25 @@ if st.button("🔎 Buscar y rellenar", type="primary", use_container_width=True)
                 if paquete:
                     nuevos[col] = paquete
 
-        estado = "completo" if nuevos else "sin ficha"
-        if not nuevos:
-            sin_ficha += 1
-        else:
+        # Si fallaron TODAS las fuentes, este libro no se ha consultado: no
+        # sabemos si tiene ficha. Marcarlo como «sin ficha» lo condenaría a que
+        # las siguientes pasadas lo saltaran para siempre por un fallo de red.
+        concluyente = len(errores) < len(FUENTES)
+        if nuevos:
             rellenadas += 1
+        elif concluyente:
+            sin_ficha += 1
 
         if not ensayo:
-            if COL_ESTADO in props_tabla:
-                paquete = empaquetar(props_tabla[COL_ESTADO], estado)
+            if COL_ESTADO in props_tabla and concluyente:
+                paquete = empaquetar(props_tabla[COL_ESTADO],
+                                     "completo" if nuevos else "sin ficha")
                 if paquete:
                     nuevos[COL_ESTADO] = paquete
             if nuevos:
                 escritas, fallidas = escribir(cfg, fila["id"], nuevos)
                 if fallidas:
-                    avisos.append(f"{fila['titulo']} → {'; '.join(fallidas)}")
+                    problemas_escritura.append(f"{fila['titulo']} → {'; '.join(fallidas)}")
             time.sleep(0.34)   # Notion admite unas 3 peticiones por segundo
 
         resumen.append({
@@ -434,14 +468,30 @@ if st.button("🔎 Buscar y rellenar", type="primary", use_container_width=True)
 
     barra2.empty()
     verbo = "Se rellenarían" if ensayo else "Rellenados"
-    st.success(f"{verbo} {rellenadas} libros. Sin ficha en ningún catálogo: {sin_ficha}.")
+    no_consultados = len(pendientes) - rellenadas - sin_ficha
+    mensaje = f"{verbo} {rellenadas} libros. Sin ficha en ningún catálogo: {sin_ficha}."
+    if no_consultados:
+        mensaje += f" No se pudieron consultar: {no_consultados}."
+    st.success(mensaje)
     if ensayo:
         st.info("Esto ha sido un ensayo: no se ha escrito nada. Desmarca la casilla para aplicarlo.")
     st.dataframe(resumen, use_container_width=True, hide_index=True)
 
-    if avisos:
-        with st.expander(f"Avisos ({len(avisos)})"):
-            st.code("\n".join(dict.fromkeys(avisos)))
+    if fallos_fuente:
+        st.subheader("Fuentes que han fallado")
+        for fuente, d in sorted(fallos_fuente.items(), key=lambda x: -x[1]["n"]):
+            st.markdown(f"**{fuente}** — {d['n']} consultas fallidas")
+            st.code(d["ejemplo"][:400])
+        if len(fallos_fuente) == len(FUENTES):
+            st.error(
+                "Han fallado **todas** las fuentes, así que este resultado no dice "
+                "nada sobre la cobertura: no se ha llegado a consultar ningún catálogo. "
+                "Arregla los errores de arriba y vuelve a lanzarlo."
+            )
+
+    if problemas_escritura:
+        with st.expander(f"Filas que Notion rechazó ({len(problemas_escritura)})"):
+            st.code("\n".join(problemas_escritura))
 
 with st.expander("Diagnóstico"):
     st.write(f"**Versión de API que funciona:** `{cfg['version']}` · endpoint `{cfg['forma']}`")
